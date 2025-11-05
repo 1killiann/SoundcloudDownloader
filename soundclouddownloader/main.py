@@ -36,7 +36,10 @@ class SoundCloudDownloader:
             "outtmpl": "%(title)s",
             "quiet": True,
             "no_warnings": True,
-            "ignoreerrors": "only_download",
+            # continue when a playlist entry fails (e.g., geo-restricted, removed, etc.)
+            "ignoreerrors": "only_download",  # use True if your yt-dlp is older
+            # optional but safe; avoids aborting on missing fragments
+            "skip_unavailable_fragments": True,
         }
 
     def download_track(self, track: Track, output_dir: Path) -> Optional[Path]:
@@ -50,46 +53,51 @@ class SoundCloudDownloader:
         Returns:
             Optional[Path]: The path to the downloaded file, or None if download failed.
         """
-        with yt_dlp.YoutubeDL(self.ydl_opts) as ydl:
-            info = ydl.extract_info(track.url, download=False)
-            filename = ydl.prepare_filename(info)
-            clean_name = clean_filename(filename)
-            filepath_without_ext = Path(output_dir) / clean_name
+        # --- metadata probe (can fail for geo-blocked tracks) ---
+        try:
+            with yt_dlp.YoutubeDL(self.ydl_opts) as ydl:
+                info = ydl.extract_info(track.url, download=False)
+                filename = ydl.prepare_filename(info)
+        except Exception as e:
+            logger.info(f"Skipping '{getattr(track, 'title', 'unknown')}' ({track.url}) — {e}")
+            return None
 
-            ydl_opts = dict(self.ydl_opts)
-            ydl_opts["outtmpl"] = str(filepath_without_ext)
+        clean_name = clean_filename(filename)
+        filepath_without_ext = Path(output_dir) / clean_name
 
+        # ensure per-track run inherits the same safe options
+        ydl_opts = dict(self.ydl_opts)
+        ydl_opts["outtmpl"] = str(filepath_without_ext)
+
+        # --- actual download (also skip on failure) ---
+        try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([track.url])
+        except Exception as e:
+            logger.info(f"Skipping '{getattr(track, 'title', 'unknown')}' during download — {e}")
+            return None
 
-            time.sleep(0.5)  # Small delay to ensure file system update
-            if filepath_without_ext.with_suffix(".mp3").exists():
-                filepath = filepath_without_ext.with_suffix(".mp3")
-            elif filepath_without_ext.exists():
-                filepath = filepath_without_ext
-            else:
-                filepath = None
+        time.sleep(0.5)  # Small delay to ensure file system update
+        if filepath_without_ext.with_suffix(".mp3").exists():
+            filepath = filepath_without_ext.with_suffix(".mp3")
+        elif filepath_without_ext.exists():
+            filepath = filepath_without_ext
+        else:
+            filepath = None
 
+        if not filepath:
+            dir_contents = list(Path(output_dir).iterdir())
+            # Try to find a file with a similar name
+            similar_files = [f for f in dir_contents if f.stem.startswith(clean_name)]
+            if similar_files:
+                filepath = similar_files[0]
             if not filepath:
-                dir_contents = list(Path(output_dir).iterdir())
+                logger.info(f"File not found after download: {filepath_without_ext}")
+                logger.debug(f"Directory contents: {[str(f) for f in dir_contents]}")
+                return None
 
-                # Try to find a file with a similar name
-                similar_files = [
-                    f for f in dir_contents if f.stem.startswith(clean_name)
-                ]
-                if similar_files:
-                    filepath = similar_files[0]
-                if not filepath:
-                    logger.info(
-                        f"File not found after download: {filepath_without_ext}"
-                    )
-                    logger.debug(
-                        f"Directory contents: {[str(f) for f in dir_contents]}"
-                    )
-                    return None
-
-            logger.info(f"Successfully downloaded: {filepath}")
-            return filepath
+        logger.info(f"Successfully downloaded: {filepath}")
+        return filepath
 
     def get_playlist_info(self, playlist_url: str) -> Playlist:
         """
@@ -103,18 +111,27 @@ class SoundCloudDownloader:
         """
         with yt_dlp.YoutubeDL(self.ydl_opts) as ydl:
             playlist_info = ydl.extract_info(playlist_url, download=False)
-            tracks = [
-                Track(
-                    id=track["id"],
-                    title=track["title"],
-                    artist=track["uploader"],
-                    url=track["webpage_url"],
-                )
-                for track in playlist_info["entries"]
-            ]
-            return Playlist(
-                id=playlist_info["id"], title=playlist_info["title"], tracks=tracks
-            )
+
+        # Filter out None/malformed entries to avoid crashes on geo-blocked items
+        raw_entries = playlist_info.get("entries") or []
+        entries = [e for e in raw_entries if isinstance(e, dict)]
+
+        tracks: List[Track] = []
+        for e in entries:
+            url = e.get("webpage_url") or e.get("url")
+            title = e.get("title")
+            tid = e.get("id")
+            artist = e.get("uploader") or e.get("uploader_id") or ""
+            # Require minimal fields; skip broken/blocked ones
+            if not (url and title and tid):
+                continue
+            tracks.append(Track(id=tid, title=title, artist=artist, url=url))
+
+        return Playlist(
+            id=playlist_info["id"],
+            title=playlist_info["title"],
+            tracks=tracks,
+        )
 
     def download_playlist(
         self,
