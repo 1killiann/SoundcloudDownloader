@@ -36,6 +36,7 @@ class SoundCloudDownloader:
             "outtmpl": "%(title)s",
             "quiet": True,
             "no_warnings": True,
+            "ignoreerrors": "only_download",
         }
 
     def download_track(self, track: Track, output_dir: Path) -> Optional[Path]:
